@@ -1,0 +1,23 @@
+# Секреты и окружение
+.env
+
+# База данных
+*.db
+*.sqlite
+*.sqlite3
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
+
+# Claude Code (локальная служебная конфигурация, не для репозитория)
+.claude/
