@@ -12,8 +12,4 @@ router = Router()
 
 @router.message(Command("emotions"))
 async def cmd_emotions(message: Message) -> None:
-    """Присылает справочник чувств. Доступна в любой момент.
-
-    Повторные вызовы не копятся: предыдущий словарик и команду убираем,
-    оставляя в чате одну актуальную карточку-справочник."""
     await show_single_command_output(message, "emotions", build_emotions_help())

@@ -29,4 +29,4 @@ python main.py
 ```
 
 Бот работает через long polling. Параметры — в `.env` (`BOT_TOKEN`, опционально
-`DB_PATH`, `DIGEST_HOUR`).
+`DB_PATH`, `DEFAULT_TZ`).

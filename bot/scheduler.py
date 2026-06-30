@@ -1,4 +1,4 @@
-"""Планировщик APScheduler: ежечасная рассылка вопросов и дайджест в конце дня."""
+"""Планировщик: ежечасные вопросы и «Итог дня» в конце окна каждого юзера."""
 
 import html
 import logging
@@ -12,87 +12,78 @@ from apscheduler.triggers.cron import CronTrigger
 
 from bot import database
 from bot import texts
-from bot.config import DIGEST_HOUR
 from bot.keyboards import emotions_keyboard
+from bot.timeutil import now_in, today_in, user_tz_name
 
 logger = logging.getLogger(__name__)
 
-# Месяцы в родительном падеже для человеческой даты в шапке («30 июня»).
 RU_MONTHS_GEN = {
     1: "января", 2: "февраля", 3: "марта", 4: "апреля", 5: "мая", 6: "июня",
     7: "июля", 8: "августа", 9: "сентября", 10: "октября", 11: "ноября", 12: "декабря",
 }
 
 
-def _is_time_to_ask(user: dict, hour: int) -> bool:
-    """Определяет, пора ли спрашивать пользователя в указанный час.
+def _window(user: dict) -> tuple[int, int]:
+    start = max(1, min(23, user["start_hour"]))
+    end = max(start, min(23, user["end_hour"]))
+    return start, end
 
-    Шлём, если час попадает в окно [start_hour, end_hour] и кратен частоте,
-    отсчитывая от начала окна.
-    """
-    start = user["start_hour"]
-    end = user["end_hour"]
-    frequency = user["frequency_hours"]
+
+def _last_slot(user: dict) -> int:
+    start, end = _window(user)
+    freq = max(1, user["frequency_hours"])
+    return start + ((end - start) // freq) * freq
+
+
+def _fallback_hour(user: dict) -> int:
+    return _last_slot(user) + 1
+
+
+def _is_time_to_ask(user: dict, hour: int) -> bool:
+    start, end = _window(user)
+    freq = max(1, user["frequency_hours"])
     if not (start <= hour <= end):
         return False
-    return (hour - start) % frequency == 0
+    return (hour - start) % freq == 0
 
 
 async def _expire_previous_question(bot: Bot, user_id: int) -> None:
-    """Гасит предыдущий неотвеченный вопрос: убирает кнопки и помечает
-    «пропущено», чтобы отвечать можно было только на актуальный вопрос."""
-    # Перечитываем свежее значение, чтобы не затереть вопрос, на который
-    # пользователь как раз начал отвечать (тогда id уже сброшен в NULL).
     fresh = await database.get_user(user_id)
     last_id = fresh.get("last_question_msg_id") if fresh else None
     if not last_id:
         return
     try:
-        # edit_message_text без reply_markup убирает inline-клавиатуру.
         await bot.edit_message_text(
             texts.QUESTION_EXPIRED, chat_id=user_id, message_id=last_id
         )
-    except Exception as exc:  # noqa: BLE001 — старое сообщение могло удалиться/устареть
+    except Exception as exc:
         logger.debug("Не удалось погасить старый вопрос %s: %s", user_id, exc)
     await database.set_last_question(user_id, None)
 
 
 async def send_reminders(bot: Bot) -> None:
-    """Ежечасная задача: рассылает Вопрос 1 тем, кому сейчас пора."""
-    now = datetime.now()
-    hour = now.hour
-    # В час дайджеста вопросы не шлём: иначе свежий вопрос мог бы попасть под
-    # вечернюю уборку (его удалят или, наоборот, оставят «висеть») — гонка
-    # между задачами reminders и digest. Час дайджеста отдаём только сводке.
-    if hour == DIGEST_HOUR:
-        return
-    today = now.strftime("%Y-%m-%d")
-    users = await database.get_all_users()
-    for user in users:
-        if not _is_time_to_ask(user, hour):
+    for user in await database.get_all_users():
+        local = now_in(user_tz_name(user))
+        if not _is_time_to_ask(user, local.hour):
             continue
         user_id = user["user_id"]
-        # Сначала гасим прошлый неотвеченный вопрос, потом шлём новый.
+        today = local.strftime("%Y-%m-%d")
         await _expire_previous_question(bot, user_id)
         try:
             sent = await bot.send_message(
                 user_id, texts.QUESTION_EMOTION, reply_markup=emotions_keyboard()
             )
         except TelegramForbiddenError:
-            # Пользователь заблокировал бота — просто пропускаем.
             logger.info("Пользователь %s заблокировал бота", user_id)
             continue
-        except Exception as exc:  # noqa: BLE001 — не хотим ронять рассылку из-за одного
+        except Exception as exc:
             logger.warning("Не удалось отправить вопрос %s: %s", user_id, exc)
             continue
-        # Запоминаем новый вопрос: для гашения (если не ответят) и для уборки
-        # всех сообщений опроса при вечернем дайджесте.
         await database.set_last_question(user_id, sent.message_id)
         await database.add_day_message(user_id, sent.message_id, today)
 
 
 def _raz(n: int) -> str:
-    """Склонение слова «раз»: 1 раз, 2–4 раза, 5+ раз."""
     if n % 10 == 1 and n % 100 != 11:
         return "раз"
     if n % 10 in (2, 3, 4) and n % 100 not in (12, 13, 14):
@@ -101,17 +92,11 @@ def _raz(n: int) -> str:
 
 
 def _bare_name(emotion: str) -> str:
-    """Из «😶 Не знаю» достаёт название без эмодзи — «Не знаю»."""
     parts = emotion.split(" ", 1)
     return parts[1] if len(parts) > 1 else emotion
 
 
 def _summary_line(counts: Counter) -> str:
-    """Живая строка-сводка вместо «турнирной таблицы» с медалями.
-
-    Если есть явный лидер (≥3 раза и больше остальных) — называем его.
-    Иначе перечисляем чувства; когда все по разу — так и пишем.
-    """
     ordered = counts.most_common()
     top_name, top_n = ordered[0]
     distinct = len(ordered)
@@ -131,12 +116,6 @@ def _summary_line(counts: Counter) -> str:
 
 
 def build_digest(entries: list[dict], day: str | None = None) -> str:
-    """Формирует текст дайджеста за день: спокойная шапка с датой, живая
-    строка-сводка и чистый хронологический список без эмодзи и лишних тире.
-
-    day (YYYY-MM-DD), если передан, показывается в шапке словами — это важно
-    для сводки «вдогонку» за пропущенный день, чтобы было видно, какой день.
-    """
     counts = Counter(_bare_name(entry["emotion"]) for entry in entries)
 
     if day:
@@ -145,20 +124,17 @@ def build_digest(entries: list[dict], day: str | None = None) -> str:
     else:
         header = "<b>Итог дня</b> 🌱"
 
-    # Шапка → пустая строка → тихая (курсивом) сводка → пустая строка → записи.
     lines = [header, "", f"<i>{_summary_line(counts)}</i>", ""]
 
     for entry in entries:
         time_str = datetime.fromisoformat(entry["timestamp"]).strftime("%H:%M")
         name = _bare_name(entry["emotion"])
-        # Обычная эмоция — «Название N/10»; «Не знаю» — «Не знаю — оттенок».
         if entry["intensity"] is not None:
             head = f"{name} {entry['intensity']}/10"
         elif entry["tone"]:
             head = f"{name} — {entry['tone']}"
         else:
             head = name
-        # Причина — произвольный текст пользователя, экранируем для HTML.
         reason = html.escape(entry["reason"]) if entry["reason"] else None
         line = f"{time_str} · {head}" + (f" — {reason}" if reason else "")
         lines.append(line)
@@ -166,71 +142,121 @@ def build_digest(entries: list[dict], day: str | None = None) -> str:
     return "\n".join(lines)
 
 
-async def send_daily_digest(bot: Bot) -> None:
-    """Ежедневная задача: по каждому накопленному дню шлёт итог и убирает
-    сообщения опроса.
+async def _deliver_digest(
+    bot: Bot, user_id: int, text: str, edit_msg_id: int | None
+) -> int | None:
+    if edit_msg_id:
+        try:
+            await bot.edit_message_text(text, chat_id=user_id, message_id=edit_msg_id)
+            return edit_msg_id
+        except TelegramForbiddenError:
+            return 0
+        except Exception as exc:
+            logger.debug("Не удалось превратить ответ в итог %s: %s", user_id, exc)
+    try:
+        sent = await bot.send_message(user_id, text)
+        return sent.message_id
+    except TelegramForbiddenError:
+        return 0
+    except Exception as exc:
+        logger.warning("Не удалось отправить итог %s: %s", user_id, exc)
+        return None
 
-    Обрабатываем сообщения, сгруппированные по дню (а не «всё за сегодня»):
-    так если бот был офлайн в час сводки, пропущенный день не теряется — его
-    сводка придёт «вдогонку», а карточки уберутся. Это же корректно работает
-    при DIGEST_HOUR = 0 (сводка приходит на следующий день, но за нужную дату).
 
-    Порядок важен и атомарен к сбою: сначала успешно шлём дайджест, и только
-    ПОТОМ удаляем карточки и строки day_messages этого дня. При временной ошибке
-    отправки строки дня остаются — сводка повторится при следующем запуске, а не
-    пропадёт вместе с уже стёртыми карточками. Ходим по всем, у кого есть
-    сообщения дня (не только по настроенным), чтобы не оставить сирот.
-    """
+async def _flush_day(
+    bot: Bot, user_id: int, day: str | None, *, edit_msg_id: int | None = None
+) -> bool:
+    grouped = await database.peek_day_messages_grouped(user_id)
+    msg_ids = grouped.get(day, [])
+    entries = await database.get_entries_for_day(user_id, day) if day else []
+
+    keep_id: int | None = None
+    if entries:
+        if await database.try_claim_digest(user_id, day):
+            delivered = await _deliver_digest(
+                bot, user_id, build_digest(entries, day), edit_msg_id
+            )
+            if delivered is None:
+                await database.release_digest(user_id, day)
+                return False
+            keep_id = delivered or None
+
+    for mid in msg_ids:
+        if keep_id and mid == keep_id:
+            continue
+        try:
+            await bot.delete_message(user_id, mid)
+        except Exception as exc:
+            logger.debug("Не удалось удалить %s/%s: %s", user_id, mid, exc)
+    await database.delete_day_messages(user_id, day)
+    await database.set_last_question(user_id, None)
+    await database.set_pinned_msg(user_id, "today", None)
+    return True
+
+
+async def flush_day_after_answer(
+    bot: Bot, user: dict | None, day: str, hour: int, edit_msg_id: int | None
+) -> bool:
+    if user is None or hour < _last_slot(user):
+        return False
+    return await _flush_day(bot, user["user_id"], day, edit_msg_id=edit_msg_id)
+
+
+async def run_digest_sweep(bot: Bot) -> None:
     for user_id in await database.get_users_with_day_messages():
+        user = await database.get_user(user_id)
+        tz = user_tz_name(user)
+        today = today_in(tz)
+        now_hour = now_in(tz).hour
         grouped = await database.peek_day_messages_grouped(user_id)
-        await database.set_last_question(user_id, None)
-
         for day in sorted(grouped, key=lambda d: d or ""):
-            # 1. Если за день есть записи — сначала шлём дайджест. Только при
-            #    успехе (или если бот заблокирован) переходим к уборке дня.
-            if day:
-                entries = await database.get_entries_for_day(user_id, day)
-                if entries:
-                    try:
-                        await bot.send_message(user_id, build_digest(entries, day))
-                    except TelegramForbiddenError:
-                        # Заблокировали бота — день всё равно считаем обработанным
-                        # (повтор не поможет), чистим строки ниже.
-                        logger.info("Пользователь %s заблокировал бота", user_id)
-                    except Exception as exc:  # noqa: BLE001 — временная ошибка сети/Telegram
-                        logger.warning("Не удалось отправить дайджест %s: %s", user_id, exc)
-                        continue  # НЕ удаляем день — сводка придёт «вдогонку»
+            if day is None:
+                await _flush_day(bot, user_id, None)
+            elif day < today:
+                await _flush_day(bot, user_id, day)
+            elif day == today and user is not None and now_hour >= _fallback_hour(user):
+                await _flush_day(bot, user_id, day)
 
-            # 2. Дайджест доставлен (или его не нужно слать) — убираем карточки
-            #    опроса этого дня и стираем строки day_messages.
-            for message_id in grouped[day]:
-                try:
-                    await bot.delete_message(user_id, message_id)
-                except Exception as exc:  # noqa: BLE001 — могло устареть/удалиться/блок
-                    logger.debug("Не удалось удалить %s/%s: %s", user_id, message_id, exc)
-            await database.delete_day_messages(user_id, day)
+
+async def hourly_tick(bot: Bot) -> None:
+    await run_digest_sweep(bot)
+    await send_reminders(bot)
 
 
 def setup_scheduler(bot: Bot) -> AsyncIOScheduler:
-    """Создаёт и настраивает планировщик с двумя задачами."""
     scheduler = AsyncIOScheduler()
-
-    # Каждый час в :00 проверяем, кому пора задать вопрос.
     scheduler.add_job(
-        send_reminders,
+        hourly_tick,
         trigger=CronTrigger(minute=0),
         args=[bot],
-        id="hourly_reminders",
+        id="hourly_tick",
         replace_existing=True,
+        misfire_grace_time=300,
+        coalesce=True,
     )
-
-    # Ежедневно в DIGEST_HOUR:00 шлём дайджест.
-    scheduler.add_job(
-        send_daily_digest,
-        trigger=CronTrigger(hour=DIGEST_HOUR, minute=0),
-        args=[bot],
-        id="daily_digest",
-        replace_existing=True,
-    )
-
     return scheduler
+
+
+async def send_timezone_question(bot: Bot, user_id: int) -> None:
+    old = await database.get_pinned_msg(user_id, "tz")
+    if old:
+        try:
+            await bot.delete_message(user_id, old)
+        except Exception as exc:
+            logger.debug("Не убрать прошлый вопрос о времени %s: %s", user_id, exc)
+    try:
+        sent = await bot.send_message(user_id, texts.TZ_QUESTION)
+    except TelegramForbiddenError:
+        logger.info("Пользователь %s заблокировал бота", user_id)
+        return
+    except Exception as exc:
+        logger.warning("Не удалось спросить время %s: %s", user_id, exc)
+        return
+    await database.set_pinned_msg(user_id, "tz", sent.message_id)
+
+
+async def prompt_missing_timezones(bot: Bot) -> None:
+    for user_id in await database.users_without_timezone():
+        if await database.get_pinned_msg(user_id, "tz"):
+            continue
+        await send_timezone_question(bot, user_id)

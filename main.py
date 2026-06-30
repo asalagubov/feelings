@@ -11,8 +11,8 @@ from aiogram.types import BotCommand
 
 from bot.config import BOT_TOKEN
 from bot.database import init_db
-from bot.handlers import emotions_help, mood, start, today
-from bot.scheduler import setup_scheduler
+from bot.handlers import emotions_help, mood, start, today, tz
+from bot.scheduler import prompt_missing_timezones, run_digest_sweep, setup_scheduler
 
 
 async def main() -> None:
@@ -21,26 +21,30 @@ async def main() -> None:
         format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
     )
 
-    # Готовим базу данных (создаём таблицы при первом запуске).
     await init_db()
 
-    # Бот с HTML-разметкой по умолчанию (нужно для <b>...</b> в сообщениях).
     bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 
-    # Хранилище FSM в памяти — достаточно для MVP.
     dp = Dispatcher(storage=MemoryStorage())
 
-    # Порядок важен: команды (start, emotions, today) идут перед mood,
-    # чтобы они не «съедались» обработчиком причины (writing_reason).
-    dp.include_routers(start.router, emotions_help.router, today.router, mood.router)
+    dp.include_routers(
+        start.router, emotions_help.router, today.router, mood.router, tz.router
+    )
 
-    # Планировщик: ежечасные вопросы + ежедневный дайджест.
     scheduler = setup_scheduler(bot)
     scheduler.start()
 
+    try:
+        await run_digest_sweep(bot)
+    except Exception as exc:
+        logging.warning("Догон итогов при старте не удался: %s", exc)
+
+    try:
+        await prompt_missing_timezones(bot)
+    except Exception as exc:
+        logging.warning("Не спросить время у юзеров без зоны: %s", exc)
+
     logging.info("Бот запущен. Останавливать — Ctrl+C.")
-    # Меню команд (кнопка «/» в Telegram). Не критично для работы — если
-    # Telegram на миг недоступен, не роняем старт бота.
     try:
         await bot.set_my_commands(
             [
@@ -50,11 +54,10 @@ async def main() -> None:
                 BotCommand(command="emotions", description="Словарик чувств"),
             ]
         )
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         logging.warning("Не удалось установить меню команд: %s", exc)
 
     try:
-        # Снимаем накопившиеся апдейты и стартуем long polling.
         await bot.delete_webhook(drop_pending_updates=True)
         await dp.start_polling(bot)
     finally:
