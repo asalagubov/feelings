@@ -51,6 +51,7 @@ async def main() -> None:
                 BotCommand(command="start", description="Начать / настроить"),
                 BotCommand(command="today", description="Итог за сегодня"),
                 BotCommand(command="settings", description="Изменить расписание"),
+                BotCommand(command="timezone", description="Часовой пояс (напр. в поездке)"),
                 BotCommand(command="emotions", description="Словарик чувств"),
             ]
         )

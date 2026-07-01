@@ -76,6 +76,18 @@ async def cmd_settings(message: Message, state: FSMContext) -> None:
     await _start_wizard(message, state, intro)
 
 
+@router.message(Command("timezone"))
+async def cmd_timezone(message: Message, state: FSMContext) -> None:
+    await _delete_message_safely(message.bot, message.chat.id, message.message_id)
+    user = await database.get_user(message.from_user.id)
+    if user is None:
+        await state.clear()
+        await message.answer(texts.NO_SETTINGS)
+        return
+    await state.clear()
+    await scheduler.send_timezone_question(message.bot, message.from_user.id)
+
+
 @router.callback_query(SetupStates.choosing_frequency, F.data.startswith("freq:"))
 async def choose_frequency(callback: CallbackQuery, state: FSMContext) -> None:
     frequency = int(callback.data.split(":", 1)[1])
